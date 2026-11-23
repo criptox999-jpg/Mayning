@@ -1,0 +1,453 @@
+const DAILY_BASE_BTC = {
+  1: 0.000012,
+  2: 0.0000032,
+  3: 0.0000528
+};
+
+const ASIC_PRICES_USD = {
+  2: 10,
+  3: 99
+};
+
+const WITHDRAW_THRESHOLD_BTC = {
+  2: 0.00016,
+  3: 0.0016
+};
+
+const STREAK_REWARDS = [
+  0.0000001, 0.0000002, 0.0000004,
+  0.0000008, 0.0000016, 0.0000032, 0.0000064
+];
+
+const DAY_MS = 86400000;
+const TWELVE_HOURS_MS = 43200000;
+const TWO_HOURS_MS = 7200000;
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, X-Admin-Id"
+    }
+  });
+}
+
+async function initTables(env) {
+  if (!env || !env.DB) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS users (
+      telegram_id TEXT PRIMARY KEY,
+      username TEXT,
+      referrer_id TEXT,
+      asic_tier INTEGER NOT NULL DEFAULT 1,
+      shop_usd REAL NOT NULL DEFAULT 0,
+      mining_btc REAL NOT NULL DEFAULT 0,
+      streak_day INTEGER NOT NULL DEFAULT 0,
+      last_streak_claim INTEGER NOT NULL DEFAULT 0,
+      boost_until INTEGER NOT NULL DEFAULT 0,
+      last_task_claim INTEGER NOT NULL DEFAULT 0,
+      last_tick INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )`
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS referrals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      referrer_id TEXT NOT NULL,
+      referred_id TEXT NOT NULL UNIQUE,
+      is_active INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )`
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform TEXT NOT NULL,
+      title TEXT NOT NULL,
+      url TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL
+    )`
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      amount_usd REAL DEFAULT 0,
+      amount_btc REAL DEFAULT 0,
+      wallet_or_tx TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL
+    )`
+  ).run();
+}
+
+async function sendTelegramMessage(env, chatId, text, replyMarkup = null) {
+  if (!env.BOT_TOKEN || !chatId) return;
+  const payload = { chat_id: String(chatId), text, parse_mode: "HTML" };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+}
+
+async function ensureUser(env, tgId, username = "", refId = null, now = Date.now()) {
+  const cleanId = String(tgId).trim();
+  let user = await env.DB.prepare(`SELECT * FROM users WHERE telegram_id = ?`).bind(cleanId).first();
+  if (!user) {
+    const validRef = refId && String(refId).trim() !== cleanId ? String(refId).trim() : null;
+    await env.DB.prepare(
+      `INSERT INTO users (telegram_id, username, referrer_id, asic_tier, shop_usd, mining_btc, streak_day, last_streak_claim, boost_until, last_task_claim, last_tick, created_at)
+       VALUES (?, ?, ?, 1, 0, 0, 0, 0, 0, 0, ?, ?)`
+    ).bind(cleanId, String(username || "").slice(0, 64), validRef, now, now).run();
+
+    if (validRef) {
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO referrals (referrer_id, referred_id, is_active, created_at) VALUES (?, ?, 0, ?)`
+      ).bind(validRef, cleanId, now).run();
+    }
+    user = await env.DB.prepare(`SELECT * FROM users WHERE telegram_id = ?`).bind(cleanId).first();
+  }
+  return user;
+}
+
+async function accrueMining(env, user, now) {
+  const elapsedSec = Math.max(0, Math.floor((now - user.last_tick) / 1000));
+  if (elapsedSec <= 0) return user;
+
+  const basePerSec = (DAILY_BASE_BTC[user.asic_tier] || DAILY_BASE_BTC[1]) / 86400;
+  const boostMult = now < user.boost_until ? 1.1 : 1.0;
+  const earned = basePerSec * boostMult * elapsedSec;
+
+  const activeRefs = await env.DB.prepare(
+    `SELECT u.asic_tier, u.boost_until FROM referrals r
+     JOIN users u ON u.telegram_id = r.referred_id
+     WHERE r.referrer_id = ? AND r.is_active = 1`
+  ).bind(user.telegram_id).all();
+
+  let refBonus = 0;
+  for (const ref of (activeRefs.results || [])) {
+    const refSec = ((DAILY_BASE_BTC[ref.asic_tier] || DAILY_BASE_BTC[1]) / 86400) * (now < ref.boost_until ? 1.1 : 1.0);
+    refBonus += refSec * elapsedSec * 0.10;
+  }
+
+  const newMiningBtc = Number((user.mining_btc + earned + refBonus).toFixed(10));
+  await env.DB.prepare(`UPDATE users SET mining_btc = ?, last_tick = ? WHERE telegram_id = ?`).bind(newMiningBtc, now, user.telegram_id).run();
+  user.mining_btc = newMiningBtc;
+  user.last_tick = now;
+  return user;
+}
+
+const HTML_APP = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HASHGRID</title>
+<style>
+  body { margin:0; font-family: Arial, sans-serif; background:#0b0d12; color:#f4f6fb; }
+  .wrap { max-width:520px; margin:0 auto; padding:16px; }
+  .top { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+  .brand { font-weight:800; font-size:20px; color:#f5b942; letter-spacing:1px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px; }
+  .card { background:#141822; border:1px solid #262d3d; border-radius:14px; padding:14px; margin-bottom:12px; }
+  .label { font-size:11px; color:#9aa4b8; text-transform:uppercase; }
+  .val { font-size:18px; font-weight:700; margin-top:4px; }
+  .btc { font-size:26px; font-weight:800; color:#f5b942; margin:8px 0; }
+  .coins { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-bottom:12px; }
+  .coin-btn, .btn { background:#1c2230; color:#fff; border:1px solid #2f384d; border-radius:10px; padding:10px; font-weight:700; cursor:pointer; }
+  .coin-btn.active { border-color:#f5b942; color:#f5b942; }
+  .btn-gold { background:#f5b942; color:#111; border:none; width:100%; margin-top:8px; }
+  .muted { color:#9aa4b8; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand">HASHGRID</div>
+    <button class="coin-btn" id="admBtn" onclick="toggleAdmin()">ADM</button>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="label">SHOP USD</div>
+      <div class="val" id="shopUsd">$0.00</div>
+    </div>
+    <div class="card">
+      <div class="label">MINING BTC</div>
+      <div class="val" id="topBtc">0.00000000</div>
+    </div>
+  </div>
+
+  <div class="coins">
+    <button class="coin-btn active" onclick="setCoin('BTC', this)">BTC</button>
+    <button class="coin-btn" onclick="setCoin('LTC', this)">LTC</button>
+    <button class="coin-btn" onclick="setCoin('DOGE', this)">DOGE</button>
+    <button class="coin-btn" onclick="setCoin('TON', this)">TON</button>
+  </div>
+
+  <div class="card">
+    <div class="label">УРОВЕНЬ ASIC: <span id="asicTier">Tier 1 (Free)</span></div>
+    <div class="btc" id="bigBalance">0.00000000 BTC</div>
+    <div class="muted" id="refInfo">Активных друзей: 0/3 (+10% бонус)</div>
+    <button class="btn btn-gold" onclick="claimStreak()">Забрать ежедневный приз (7 дней)</button>
+    <button class="btn" style="width:100%;margin-top:8px" onclick="claimTask()">Задание (+10% на 2ч / раз в 12ч)</button>
+  </div>
+
+  <div class="card">
+    <div class="label">МАГАЗИН ASIC (ЗА SHOP USD)</div>
+    <div class="muted" style="margin-top:6px">Tier 2 (Pulse Rack) — $10 • порог вывода 0.00016 BTC</div>
+    <button class="btn btn-gold" onclick="buyAsic(2)">Купить Tier 2 за $10</button>
+    <div class="muted" style="margin-top:12px">Tier 3 (Forge Vault) — $99 • порог вывода 0.0016 BTC</div>
+    <button class="btn btn-gold" onclick="buyAsic(3)">Купить Tier 3 за $99</button>
+  </div>
+
+  <div class="card" id="adminBox" style="display:none">
+    <div class="label">КАБИНЕТ АДМИНА</div>
+    <input id="admUserId" placeholder="Telegram ID игрока" style="width:100%;padding:8px;margin-top:8px;border-radius:8px;border:1px solid #333;background:#0e121a;color:#fff" />
+    <input id="admUsd" placeholder="Сумма SHOP USD (например 10)" style="width:100%;padding:8px;margin-top:8px;border-radius:8px;border:1px solid #333;background:#0e121a;color:#fff" />
+    <button class="btn btn-gold" onclick="adminTopup()">Начислить SHOP USD</button>
+  </div>
+</div>
+
+<script>
+const tgUser = window.Telegram?.WebApp?.initDataUnsafe?.user;
+const USER_ID = String(tgUser?.id || new URLSearchParams(location.search).get("uid") || "demo_user");
+const REF_ID = new URLSearchParams(location.search).get("startapp")?.replace("ref_", "") || null;
+
+let state = { shop_usd: 0, mining_btc: 0, asic_tier: 1, active_referrals: 0 };
+let coin = "BTC";
+const RATES = { BTC: 61500, LTC: 40.7, DOGE: 0.0556, TON: 0.96 };
+
+function render() {
+  document.getElementById("shopUsd").textContent = "$" + Number(state.shop_usd || 0).toFixed(2);
+  document.getElementById("topBtc").textContent = Number(state.mining_btc || 0).toFixed(8);
+  const usdVal = Number(state.mining_btc || 0) * RATES.BTC;
+  const coinVal = usdVal / RATES[coin];
+  const dec = coin === "DOGE" ? 4 : 8;
+  document.getElementById("bigBalance").textContent = coinVal.toFixed(dec) + " " + coin;
+  document.getElementById("asicTier").textContent = state.asic_tier === 3 ? "Tier 3 ($99)" : state.asic_tier === 2 ? "Tier 2 ($10)" : "Tier 1 (Free)";
+  document.getElementById("refInfo").textContent = "Активных друзей: " + state.active_referrals + "/3 (+10% бонус)";
+}
+
+function setCoin(c, el) {
+  coin = c;
+  document.querySelectorAll(".coin-btn").forEach(b => b.classList.remove("active"));
+  if (el) el.classList.add("active");
+  render();
+}
+
+function toggleAdmin() {
+  const box = document.getElementById("adminBox");
+  box.style.display = box.style.display === "none" ? "block" : "none";
+}
+
+async function api(path, body = {}) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Admin-Id": USER_ID },
+    body: JSON.stringify({ telegram_id: USER_ID, ...body })
+  });
+  return res.json();
+}
+
+async function loadProfile() {
+  const data = await api("/api/auth", { username: tgUser?.username || "", referrer_id: REF_ID });
+  if (data.user) {
+    state = { ...data.user, active_referrals: data.active_referrals || 0 };
+    render();
+  }
+}
+
+async function claimStreak() {
+  const d = await api("/api/claim-streak");
+  if (d.error) return alert(d.error);
+  state.mining_btc = d.mining_btc;
+  render();
+  alert("Получено: +" + d.reward_btc + " BTC (День " + d.day + ")");
+}
+
+async function claimTask() {
+  const d = await api("/api/claim-task");
+  if (d.error) return alert(d.error);
+  alert("Буст +10% активирован на 2 часа!");
+}
+
+async function buyAsic(tier) {
+  const d = await api("/api/buy-asic", { tier });
+  if (d.error) return alert(d.error);
+  state.asic_tier = d.asic_tier;
+  state.shop_usd = d.shop_usd;
+  render();
+  alert("Куплен ASIC Tier " + tier);
+}
+
+async function adminTopup() {
+  const targetId = document.getElementById("admUserId").value.trim();
+  const amountUsd = Number(document.getElementById("admUsd").value);
+  const d = await api("/api/admin/deposit/approve", { telegram_id: targetId, amount_usd: amountUsd });
+  if (d.error) return alert(d.error);
+  alert("Начислено $" + amountUsd + " игроку " + targetId);
+  loadProfile();
+}
+
+loadProfile();
+setInterval(loadProfile, 10000);
+</script>
+</body>
+</html>`;
+
+export default {
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") return json({ ok: true });
+    const url = new URL(request.url);
+    const now = Date.now();
+
+    await initTables(env);
+
+    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+      return new Response(HTML_APP, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+
+    try {
+      if (url.pathname === "/api/telegram/webhook" && request.method === "POST") {
+        const update = await request.json();
+        const msg = update.message;
+        if (!msg || !msg.text) return json({ ok: true });
+        const chatId = String(msg.chat.id);
+        const fromId = String(msg.from?.id || chatId);
+        const text = msg.text.trim();
+
+        if (text.startsWith("/start")) {
+          const payload = text.split(/\s+/)[1] || "";
+          const refId = payload.startsWith("ref_") ? payload.replace("ref_", "") : null;
+          await ensureUser(env, fromId, msg.from?.username || "", refId, now);
+          const appUrl = env.MINI_APP_URL || `${url.origin}/`;
+          await sendTelegramMessage(env, chatId, `<b>HASHGRID</b> готов к работе.`, {
+            inline_keyboard: [[{ text: "⛏️ Открыть HASHGRID", web_app: { url: appUrl } }]]
+          });
+          return json({ ok: true });
+        }
+
+        if (env.ADMIN_ID && fromId === String(env.ADMIN_ID)) {
+          if (text.startsWith("/addtask ")) {
+            const raw = text.replace("/addtask ", "").split("|").map(s => s.trim());
+            if (raw.length >= 3) {
+              await env.DB.prepare(`INSERT INTO tasks (platform, title, url, is_active, created_at) VALUES (?, ?, ?, 1, ?)`)
+                .bind(raw[0] === "tiktok" ? "tiktok" : "telegram", raw[1], raw[2], now).run();
+              await sendTelegramMessage(env, chatId, `✅ Добавлено: <b>${raw[1]}</b>`);
+            }
+            return json({ ok: true });
+          }
+          if (text.startsWith("/topup ")) {
+            const [, targetId, amountRaw] = text.split(/\s+/);
+            const amt = Number(amountRaw);
+            if (targetId && amt > 0) {
+              await ensureUser(env, targetId, "", null, now);
+              await env.DB.prepare(`UPDATE users SET shop_usd = ROUND(shop_usd + ?, 2) WHERE telegram_id = ?`).bind(amt, targetId).run();
+              await sendTelegramMessage(env, chatId, `💵 Начислено <b>$${amt}</b> игроку <code>${targetId}</code>`);
+            }
+            return json({ ok: true });
+          }
+        }
+        return json({ ok: true });
+      }
+
+      if (url.pathname === "/api/auth" && request.method === "POST") {
+        const body = await request.json();
+        const tgId = String(body.telegram_id || "").trim();
+        if (!tgId) return json({ error: "telegram_id required" }, 400);
+        let user = await ensureUser(env, tgId, body.username || "", body.referrer_id || null, now);
+        user = await accrueMining(env, user, now);
+        if (user.referrer_id) {
+          await env.DB.prepare(`UPDATE referrals SET is_active = 1 WHERE referred_id = ?`).bind(tgId).run();
+        }
+        const refsRow = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id = ? AND is_active = 1`).bind(tgId).first();
+        return json({ user, active_referrals: refsRow?.cnt || 0 });
+      }
+
+      if (url.pathname === "/api/claim-streak" && request.method === "POST") {
+        const { telegram_id } = await request.json();
+        const tgId = String(telegram_id || "");
+        let user = await env.DB.prepare(`SELECT * FROM users WHERE telegram_id = ?`).bind(tgId).first();
+        if (!user) return json({ error: "User not found" }, 404);
+        user = await accrueMining(env, user, now);
+        const sinceClaim = now - user.last_streak_claim;
+        if (user.last_streak_claim > 0 && sinceClaim < DAY_MS) return json({ error: "Already claimed today" }, 400);
+        let nextDay = (user.last_streak_claim > 0 && sinceClaim <= DAY_MS * 2) ? (user.streak_day >= 7 ? 1 : user.streak_day + 1) : 1;
+        const reward = STREAK_REWARDS[nextDay - 1];
+        const newBtc = Number((user.mining_btc + reward).toFixed(10));
+        await env.DB.prepare(`UPDATE users SET streak_day = ?, last_streak_claim = ?, mining_btc = ? WHERE telegram_id = ?`).bind(nextDay, now, newBtc, tgId).run();
+        return json({ ok: true, day: nextDay, reward_btc: reward, mining_btc: newBtc });
+      }
+
+      if (url.pathname === "/api/claim-task" && request.method === "POST") {
+        const { telegram_id } = await request.json();
+        const tgId = String(telegram_id || "");
+        const user = await env.DB.prepare(`SELECT * FROM users WHERE telegram_id = ?`).bind(tgId).first();
+        if (!user) return json({ error: "User not found" }, 404);
+        if (now - user.last_task_claim < TWELVE_HOURS_MS) return json({ error: "Cooldown 12h active" }, 400);
+        const boostUntil = now + TWO_HOURS_MS;
+        await env.DB.prepare(`UPDATE users SET last_task_claim = ?, boost_until = ? WHERE telegram_id = ?`).bind(now, boostUntil, tgId).run();
+        return json({ ok: true, boost_until: boostUntil });
+      }
+
+      if (url.pathname === "/api/buy-asic" && request.method === "POST") {
+        const { telegram_id, tier } = await request.json();
+        const tgId = String(telegram_id || "");
+        const targetTier = Number(tier);
+        if (![2, 3].includes(targetTier)) return json({ error: "Invalid tier" }, 400);
+        let user = await env.DB.prepare(`SELECT * FROM users WHERE telegram_id = ?`).bind(tgId).first();
+        if (!user) return json({ error: "User not found" }, 404);
+        user = await accrueMining(env, user, now);
+        const price = ASIC_PRICES_USD[targetTier];
+        if (user.shop_usd < price) return json({ error: "Insufficient SHOP USD" }, 400);
+        const newShopUsd = Number((user.shop_usd - price).toFixed(2));
+        await env.DB.prepare(`UPDATE users SET shop_usd = ?, asic_tier = ? WHERE telegram_id = ?`).bind(newShopUsd, targetTier, tgId).run();
+        return json({ ok: true, asic_tier: targetTier, shop_usd: newShopUsd });
+      }
+
+      if (url.pathname === "/api/withdraw" && request.method === "POST") {
+        const { telegram_id, wallet } = await request.json();
+        const tgId = String(telegram_id || "");
+        if (!String(wallet || "").trim()) return json({ error: "Wallet required" }, 400);
+        let user = await env.DB.prepare(`SELECT * FROM users WHERE telegram_id = ?`).bind(tgId).first();
+        if (!user) return json({ error: "User not found" }, 404);
+        user = await accrueMining(env, user, now);
+        if (user.asic_tier < 2) return json({ error: "ASIC Tier 2+ required" }, 400);
+        const refsRow = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id = ? AND is_active = 1`).bind(tgId).first();
+        if ((refsRow?.cnt || 0) < 3) return json({ error: "3 active referrals required" }, 400);
+        const threshold = WITHDRAW_THRESHOLD_BTC[user.asic_tier] || WITHDRAW_THRESHOLD_BTC[2];
+        if (user.mining_btc < threshold) return json({ error: "Threshold not reached" }, 400);
+        const amountBtc = user.mining_btc;
+        await env.DB.prepare(`UPDATE users SET mining_btc = 0 WHERE telegram_id = ?`).bind(tgId).run();
+        await env.DB.prepare(`INSERT INTO requests (telegram_id, type, amount_btc, wallet_or_tx, status, created_at) VALUES (?, 'withdraw', ?, ?, 'pending', ?)`).bind(tgId, amountBtc, String(wallet).trim(), now).run();
+        if (env.ADMIN_ID) await sendTelegramMessage(env, env.ADMIN_ID, `💸 Вывод: <code>${tgId}</code> — <b>${amountBtc} BTC</b>\nКошелёк: <code>${String(wallet).trim()}</code>`);
+        return json({ ok: true, amount_btc: amountBtc });
+      }
+
+      const adminId = request.headers.get("X-Admin-Id") || "";
+      if (url.pathname.startsWith("/api/admin/")) {
+        if (!env.ADMIN_ID || adminId !== String(env.ADMIN_ID)) return json({ error: "Forbidden" }, 403);
+        if (url.pathname === "/api/admin/deposit/approve" && request.method === "POST") {
+          const { telegram_id, amount_usd } = await request.json();
+          const amt = Number(amount_usd);
+          if (!telegram_id || amt <= 0) return json({ error: "Invalid data" }, 400);
+          await ensureUser(env, telegram_id, "", null, now);
+          await env.DB.prepare(`UPDATE users SET shop_usd = ROUND(shop_usd + ?, 2) WHERE telegram_id = ?`).bind(amt, String(telegram_id)).run();
+          return json({ ok: true });
+        }
+      }
+
+      return json({ error: "Not found" }, 404);
+    } catch (err) {
+      return json({ error: err.message || "Server error" }, 500);
+    }
+  }
+};
